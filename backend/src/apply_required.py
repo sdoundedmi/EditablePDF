@@ -68,60 +68,6 @@ def _build_names_js() -> str:
     return 'app.setInterval("try{this.dirty=true;}catch(e){}", 2000);'
 
 
-def _build_keystroke_js(fname: str, is_required: bool, is_integer: bool,
-                       is_radio: bool = False) -> str:
-    """Build a unified keystroke handler for a field.
-
-    The /K (keystroke) trigger fires on every keystroke AND on commit
-    (when event.willCommit is true, i.e. user tabs out / clicks away).
-    This is the most reliable trigger in Adobe Acrobat.
-
-    Combines:
-    - Integer filtering via AFNumber_Keystroke (on each keystroke)
-    - Required border check (on commit only)
-    """
-    parts = []
-
-    if is_integer and is_required:
-        # Integer filter on keystrokes, border check on commit
-        if is_radio:
-            cond = 'f.value==="Off"||f.value===""||f.value==null'
-        else:
-            cond = 'f.value===""||f.value==null'
-        parts.append(
-            'if(event.willCommit){'
-            f'var f=this.getField("{fname}");'
-            f'if(f&&({cond})){{f.strokeColor=color.red;f.fillColor=["RGB",1,0.93,0.93];}}'
-            f'else if(f){{f.strokeColor={_GRAY_BORDER};f.fillColor={_ORIG_FILL};}}'
-            '}else{'
-            'AFNumber_Keystroke(0,0,0,0,"",true);'
-            '}'
-        )
-    elif is_integer:
-        parts.append('AFNumber_Keystroke(0,0,0,0,"",true);')
-    elif is_required:
-        if is_radio:
-            cond = 'f.value==="Off"||f.value===""||f.value==null'
-        else:
-            cond = 'f.value===""||f.value==null'
-        parts.append(
-            'if(event.willCommit){'
-            f'var f=this.getField("{fname}");'
-            f'if(f&&({cond})){{f.strokeColor=color.red;f.fillColor=["RGB",1,0.93,0.93];}}'
-            f'else if(f){{f.strokeColor={_GRAY_BORDER};f.fillColor={_ORIG_FILL};}}'
-            '}'
-        )
-
-    return ''.join(parts)
-
-
-def _build_format_js(is_required: bool, is_integer: bool, fname: str,
-                     is_radio: bool = False) -> str | None:
-    """Build a format handler. Returns None if no format action needed."""
-    if is_integer:
-        return 'AFNumber_Format(0,0,0,0,"",true);'
-    return None
-
 
 def _build_open_js(required_fields: list[tuple[str, str, bool]]) -> str:
     """JS that runs on document open:
@@ -496,6 +442,7 @@ def apply_required(pdf_path: str, fields: list[dict],
     updated_count = 0
     seen_radio_groups = set()
     required_field_info = []  # (field_name, display_label, is_radio)
+    delete_xrefs = []  # xrefs of widgets marked for deletion
     
 
     for page_num in range(doc.page_count):
@@ -510,14 +457,26 @@ def apply_required(pdf_path: str, fields: list[dict],
             is_checkbox = widget.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX
             is_text = widget.field_type == fitz.PDF_WIDGET_TYPE_TEXT
 
+            # Map widget type to extractor's field_type string
+            is_multiline = is_text and bool(widget.field_flags & (1 << 12))
+            _wtype = ("radio" if is_radio else
+                      "checkbox" if is_checkbox else
+                      "textarea" if is_multiline else
+                      "text" if is_text else None)
+
             # Build the same field_id the extractor would produce
             is_radio_dup = False
             if is_radio:
                 clean_label = label.split(":")[0].strip() if ":" in label else label
                 candidate_id = _label_to_field_id(clean_label) or field_name
                 if field_name in seen_radio_groups:
-                    # Still apply required flag to duplicate radio children
+                    # Check if radio group is deleted — collect all children
                     fdata = _resolve_field(field_lookup, candidate_id)
+                    if fdata and bool(fdata.get("deleted", False)):
+                        delete_xrefs.append(widget.xref)
+                        is_radio_dup = True
+                        continue
+                    # Still apply required flag to duplicate radio children
                     if fdata and not fdata.get("readonly", False):
                         is_req = bool(fdata.get("required", False))
                         _set_required_flag(doc, widget, is_req)
@@ -534,8 +493,14 @@ def apply_required(pdf_path: str, fields: list[dict],
                 continue
 
             # Resolve field metadata from the JSON
-            fdata = _resolve_field(field_lookup, candidate_id)
+            fdata = _resolve_field(field_lookup, candidate_id, widget_type=_wtype)
             if fdata is None:
+                continue
+
+            # --- Delete field if user marked it for deletion ---
+            is_deleted = bool(fdata.get("deleted", False))
+            if is_deleted:
+                delete_xrefs.append(widget.xref)
                 continue
 
             display_label = fdata.get("label", label or field_name)
@@ -566,25 +531,46 @@ def apply_required(pdf_path: str, fields: list[dict],
                 _prepare_text_scroll(widget)
 
             # --- Per-field JS actions via widget API ---
+            # Red borders are handled at document level only (OpenAction,
+            # WillSave, WillPrint). No per-field border triggers — Adobe
+            # does not visually repaint annotations from JS event handlers.
             need_update = False
             is_integer = is_text and data_type == "integer"
+            max_length = fdata.get("max_length")
+            if max_length is not None:
+                try:
+                    max_length = int(max_length)
+                    if max_length <= 0:
+                        max_length = None
+                except (ValueError, TypeError):
+                    max_length = None
 
-            # Unified keystroke handler: border check on commit + integer filter
-            if is_required or is_integer:
-                ks_js = _build_keystroke_js(field_name, is_required, is_integer, is_radio)
-                if ks_js:
-                    # Preserve existing keystroke handler (e.g. character counter)
-                    existing_ks = widget.script_stroke or ""
-                    if existing_ks:
-                        widget.script_stroke = ks_js + "\n" + existing_ks
-                    else:
-                        widget.script_stroke = ks_js
-                    need_update = True
+            # Integer-only: keystroke filter + format
+            if is_integer:
+                widget.script_format = 'AFNumber_Format(0,0,0,0,"",true);'
+                existing_ks = widget.script_stroke or ""
+                int_js = 'AFNumber_Keystroke(0,0,0,0,"",true);'
+                if existing_ks:
+                    widget.script_stroke = int_js + "\n" + existing_ks
+                else:
+                    widget.script_stroke = int_js
+                need_update = True
 
-            # Format handler for integer fields
-            fmt_js = _build_format_js(is_required, is_integer, field_name, is_radio)
-            if fmt_js:
-                widget.script_format = fmt_js
+            # Max length JS guard: block keystrokes that would exceed limit
+            # Chains with existing keystroke handler (integer or char counter)
+            if is_text and max_length is not None:
+                max_js = (
+                    'if(!event.willCommit){'
+                    'var proposed=AFMergeChange(event);'
+                    f'if(proposed.length>{max_length})'
+                    '{event.rc=false;}'
+                    '}'
+                )
+                existing_ks = widget.script_stroke or ""
+                if existing_ks:
+                    widget.script_stroke = existing_ks + "\n" + max_js
+                else:
+                    widget.script_stroke = max_js
                 need_update = True
 
             if need_update:
@@ -595,12 +581,44 @@ def apply_required(pdf_path: str, fields: list[dict],
             if is_text:
                 _fix_font_for_scroll(doc, widget)
 
+            # --- Max length: set /MaxLen on widget (AFTER all updates) ---
+            if is_text and max_length is not None:
+                xref = widget.xref
+                obj_str = doc.xref_object(xref)
+                if re.search(r'/MaxLen\s+\d+', obj_str):
+                    obj_str = re.sub(r'/MaxLen\s+\d+', f'/MaxLen {max_length}', obj_str)
+                else:
+                    obj_str = obj_str.rstrip().rstrip('>') + f' /MaxLen {max_length} >>'
+                doc.update_object(xref, obj_str)
+
+    # --- Delete marked widgets by removing them from page /Annots ---
+    if delete_xrefs:
+        delete_set = set(delete_xrefs)
+        for page_num in range(doc.page_count):
+            page = doc[page_num]
+            page_xref = page.xref
+            page_obj = doc.xref_object(page_xref)
+            # Find all annotation refs in /Annots
+            annots_match = re.search(r'/Annots\s*\[([^\]]*)\]', page_obj)
+            if not annots_match:
+                continue
+            annots_str = annots_match.group(1)
+            refs = re.findall(r'(\d+)\s+0\s+R', annots_str)
+            new_refs = [r for r in refs if int(r) not in delete_set]
+            if len(new_refs) == len(refs):
+                continue  # no deletions on this page
+            new_annots = ' '.join(f'{r} 0 R' for r in new_refs)
+            new_page_obj = page_obj.replace(
+                annots_match.group(0), f'/Annots [{new_annots}]'
+            )
+            doc.update_object(page_xref, new_page_obj)
+
     # Inject document-level actions: OpenAction, WillSave, WillPrint, WillClose
     if required_field_info:
         _inject_catalog_actions(doc, required_field_info)
 
     # Fix tab order on every page: sort annotations by position (row order)
-    _fix_tab_order(doc)
+    _fix_tab_order(doc, exclude_xrefs=set(delete_xrefs) if delete_xrefs else None)
 
     # Save
     if output_path is None:
@@ -617,15 +635,30 @@ def apply_required(pdf_path: str, fields: list[dict],
     }
 
 
-def _resolve_field(field_lookup: dict, candidate_id: str) -> dict | None:
-    """Look up a field in the lookup dict, trying suffixed variants."""
+def _resolve_field(field_lookup: dict, candidate_id: str,
+                   widget_type: str | None = None) -> dict | None:
+    """Look up a field in the lookup dict, trying suffixed variants.
+
+    If *widget_type* is given (e.g. "text", "radio") and the base match
+    has a different field_type, skip it and try suffixed variants.  This
+    handles the case where a text field and a radio group share the same
+    label — the extractor gives the text field a ``_2`` suffix.
+    """
     fdata = field_lookup.get(candidate_id)
     if fdata is not None:
-        return fdata
+        if widget_type is None or fdata.get("field_type", "") == widget_type:
+            return fdata
+        # Type mismatch — fall through to suffixed search
     for suffix in range(2, 20):
         alt_id = f"{candidate_id}_{suffix}"
-        if alt_id in field_lookup:
-            return field_lookup[alt_id]
+        fd = field_lookup.get(alt_id)
+        if fd is not None:
+            if widget_type is None or fd.get("field_type", "") == widget_type:
+                return fd
+    # If nothing matched with type filter, return the base match anyway
+    # (better than None — lets other logic still apply)
+    if fdata is not None:
+        return fdata
     return None
 
 
@@ -655,7 +688,7 @@ def _set_readonly_flag(doc, widget, is_readonly: bool):
         widget.update()
 
 
-def _fix_tab_order(doc):
+def _fix_tab_order(doc, exclude_xrefs=None):
     """Reorder annotations on every page so Tab key follows visual layout.
 
     Sorts widget annotations by position (top-to-bottom, left-to-right)
@@ -681,9 +714,12 @@ def _fix_tab_order(doc):
             continue
 
         # Build list of (xref, y, x) for widget annotations
+        _skip = exclude_xrefs or set()
         widget_items = []
         for w in page.widgets():
             if w.rect.x0 < 0:
+                continue
+            if w.xref in _skip:
                 continue
             # Sort by: y-position (top of field), then x-position (left edge)
             # Use a tolerance band for y to group fields on the same row
@@ -714,9 +750,9 @@ def _fix_tab_order(doc):
         # Parse all xrefs from the annots array
         all_annot_xrefs = [int(m.group(1)) for m in re.finditer(r'(\d+)\s+0\s+R', annots_str)]
 
-        # Separate widget xrefs from non-widget xrefs
+        # Separate widget xrefs from non-widget xrefs (also exclude deleted)
         sorted_set = set(sorted_xrefs)
-        non_widget_xrefs = [x for x in all_annot_xrefs if x not in sorted_set]
+        non_widget_xrefs = [x for x in all_annot_xrefs if x not in sorted_set and x not in _skip]
 
         # Build new annots array: sorted widgets first, then non-widgets
         new_annots = sorted_xrefs + non_widget_xrefs
